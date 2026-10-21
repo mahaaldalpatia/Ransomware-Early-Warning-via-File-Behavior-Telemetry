@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Database files
+database/*.db-wal
+database/*.db-shm
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Test data (temporary simulated files)
+test_data/*.txt
+test_data/*.locked_test
+test_data/*.crypto
+test_data/*.enc

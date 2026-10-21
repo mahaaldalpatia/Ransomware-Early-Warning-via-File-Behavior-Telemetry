@@ -2,7 +2,10 @@ import os
 import sqlite3
 import hashlib
 import math
-
+import time
+import queue
+import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -15,30 +18,41 @@ from watchdog.events import FileSystemEventHandler
 # --------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 WATCH_DIR = BASE_DIR / "test_data"
-
 DATABASE_DIR = BASE_DIR / "database"
 DATABASE_PATH = DATABASE_DIR / "telemetry.db"
 
 # A unique ID for every collector run
 RUN_ID = datetime.now().strftime("RUN_%Y%m%d_%H%M%S")
 
+# Real-time sliding window configuration for live early-warning
+SLIDING_WINDOW_SECONDS = 5.0
+LIVE_BURST_RATE_THRESHOLD = 15.0  # ops/sec
+LIVE_ENTROPY_THRESHOLD = 7.0
 
 # --------------------------------------------------
-# DATABASE
+# THREAD-SAFE DATABASE WRITER & QUEUE
 # --------------------------------------------------
+
+event_queue = queue.Queue()
+_db_stop_event = threading.Event()
+_live_events_window = deque()
+_live_alert_triggered = False
+
 
 def initialize_database():
     """
-    Create the database and file_events table if they
-    do not already exist.
+    Create the database, file_events table, and high-performance
+    indices if they do not already exist.
     """
-
     DATABASE_DIR.mkdir(exist_ok=True)
 
     connection = sqlite3.connect(DATABASE_PATH)
     cursor = connection.cursor()
+
+    # Enable WAL mode for high concurrent write throughput
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS file_events (
@@ -53,78 +67,170 @@ def initialize_database():
         )
     """)
 
+    # Indices for blazing fast queries in detector, analyzer, and dashboard
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_file_events_run_id 
+        ON file_events(run_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_file_events_run_timestamp 
+        ON file_events(run_id, timestamp)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_file_events_run_type 
+        ON file_events(run_id, event_type)
+    """)
+
     connection.commit()
     connection.close()
 
 
+def db_writer_worker():
+    """
+    Dedicated background worker thread that drains the event queue
+    and performs efficient batch inserts to SQLite.
+    """
+    connection = sqlite3.connect(DATABASE_PATH)
+    cursor = connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+
+    insert_sql = """
+        INSERT INTO file_events
+        (run_id, timestamp, event_type, file_path, file_size, sha256, entropy)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+
+    batch = []
+    last_commit_time = time.time()
+
+    while not _db_stop_event.is_set() or not event_queue.empty():
+        try:
+            # Wait up to 100ms for an event
+            event_data = event_queue.get(timeout=0.1)
+            batch.append(event_data)
+            event_queue.task_done()
+        except queue.Empty:
+            pass
+
+        now = time.time()
+        # Commit batch if it has 50+ items or at least 0.5s has elapsed
+        if batch and (len(batch) >= 50 or (now - last_commit_time) >= 0.5 or _db_stop_event.is_set()):
+            cursor.executemany(insert_sql, batch)
+            connection.commit()
+            batch.clear()
+            last_commit_time = now
+
+    # Final flush
+    if batch:
+        cursor.executemany(insert_sql, batch)
+        connection.commit()
+
+    connection.close()
+
+
 # --------------------------------------------------
-# FILE HASH
+# FILE HASH (SHA-256)
 # --------------------------------------------------
 
 def calculate_sha256(file_path):
     """
-    Calculate SHA-256 hash of a file.
-
-    Returns None if the file cannot be read.
+    Calculate SHA-256 hash of a file with retry handling
+    for transient Windows file locking.
     """
-
-    try:
-        sha256 = hashlib.sha256()
-
-        with open(file_path, "rb") as file:
-            while chunk := file.read(8192):
-                sha256.update(chunk)
-
-        return sha256.hexdigest()
-
-    except (FileNotFoundError, PermissionError, OSError):
-        return None
+    for _ in range(3):
+        try:
+            sha256 = hashlib.sha256()
+            with open(file_path, "rb") as file:
+                while chunk := file.read(65536):
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+        except (PermissionError, OSError):
+            time.sleep(0.01)
+        except FileNotFoundError:
+            return None
+    return None
 
 
 # --------------------------------------------------
-# FILE ENTROPY
+# FILE ENTROPY (SHANNON ENTROPY)
 # --------------------------------------------------
 
 def calculate_entropy(file_path):
     """
-    Calculate Shannon entropy of a file.
-
-    Entropy range:
-        0.0 -> very predictable data
-        8.0 -> highly random-looking data
-
-    Returns None if the file cannot be read.
+    Calculate Shannon entropy of a file (range 0.0 to 8.0).
+    Values > 7.0 strongly indicate encrypted or compressed data.
     """
+    for _ in range(3):
+        try:
+            with open(file_path, "rb") as file:
+                data = file.read()
 
-    try:
-        with open(file_path, "rb") as file:
-            data = file.read()
+            if not data:
+                return 0.0
 
-        if not data:
-            return 0.0
+            frequency = [0] * 256
+            for byte in data:
+                frequency[byte] += 1
 
-        # Count frequency of every possible byte value
-        frequency = [0] * 256
+            entropy = 0.0
+            data_length = len(data)
 
-        for byte in data:
-            frequency[byte] += 1
+            for count in frequency:
+                if count == 0:
+                    continue
+                probability = count / data_length
+                entropy -= probability * math.log2(probability)
 
-        entropy = 0.0
-        data_length = len(data)
+            return round(entropy, 4)
+        except (PermissionError, OSError):
+            time.sleep(0.01)
+        except FileNotFoundError:
+            return None
+    return None
 
-        for count in frequency:
 
-            if count == 0:
-                continue
+# --------------------------------------------------
+# REAL-TIME EARLY WARNING EVALUATION
+# --------------------------------------------------
 
-            probability = count / data_length
+def check_live_early_warning(event_type, file_path, entropy):
+    """
+    Evaluates events in a rolling sliding window to raise early warning
+    alerts in real-time before mass encryption is complete.
+    """
+    global _live_alert_triggered
+    current_time = time.time()
+    _live_events_window.append((current_time, event_type, file_path, entropy))
 
-            entropy -= probability * math.log2(probability)
+    # Evict events older than SLIDING_WINDOW_SECONDS
+    cutoff = current_time - SLIDING_WINDOW_SECONDS
+    while _live_events_window and _live_events_window[0][0] < cutoff:
+        _live_events_window.popleft()
 
-        return round(entropy, 4)
+    window_size = len(_live_events_window)
+    if window_size < 5:
+        return
 
-    except (FileNotFoundError, PermissionError, OSError):
-        return None
+    duration = max(current_time - _live_events_window[0][0], 0.1)
+    rate = window_size / duration
+
+    # Count high entropy files and suspicious renames in window
+    high_entropy_count = sum(1 for e in _live_events_window if e[3] is not None and e[3] >= LIVE_ENTROPY_THRESHOLD)
+    suspicious_renames = sum(
+        1 for e in _live_events_window
+        if e[1] == "MOVE_TO" and any(e[2].endswith(ext) for ext in [".locked", ".locked_test", ".crypto", ".enc"])
+    )
+
+    # Condition for real-time alert trigger
+    if (rate >= LIVE_BURST_RATE_THRESHOLD or suspicious_renames >= 3) and (high_entropy_count >= 3 or suspicious_renames >= 3):
+        if not _live_alert_triggered:
+            _live_alert_triggered = True
+            print("\n" + "!" * 70)
+            print(" [!!!] EARLY-WARNING ALERT TRIGGERED IN REAL TIME [!!!]")
+            print(f" Event Rate: {rate:.1f} ops/sec | High-Entropy Files: {high_entropy_count} | Suspicious Extensions: {suspicious_renames}")
+            print(" Potential ransomware encryption activity detected in progress!")
+            print("!" * 70 + "\n")
 
 
 # --------------------------------------------------
@@ -133,45 +239,24 @@ def calculate_entropy(file_path):
 
 def record_event(event_type, file_path):
     """
-    Record a filesystem event in SQLite.
+    Extract file telemetry and push event to the asynchronous writer queue.
     """
-
     timestamp = datetime.now().isoformat(timespec="milliseconds")
 
     file_size = None
     file_hash = None
     file_entropy = None
 
-    # File may disappear immediately after an event,
-    # so all file calculations are protected.
     if os.path.isfile(file_path):
-
         try:
             file_size = os.path.getsize(file_path)
-
             file_hash = calculate_sha256(file_path)
-
             file_entropy = calculate_entropy(file_path)
-
         except OSError:
             pass
 
-    connection = sqlite3.connect(DATABASE_PATH)
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        INSERT INTO file_events
-        (
-            run_id,
-            timestamp,
-            event_type,
-            file_path,
-            file_size,
-            sha256,
-            entropy
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
+    # Push to background database writer
+    event_queue.put((
         RUN_ID,
         timestamp,
         event_type,
@@ -181,14 +266,11 @@ def record_event(event_type, file_path):
         file_entropy
     ))
 
-    connection.commit()
-    connection.close()
+    # Evaluate live early warning
+    check_live_early_warning(event_type, str(file_path), file_entropy)
 
-    print(
-        f"[{timestamp}] "
-        f"{event_type:<10} "
-        f"{file_path}"
-    )
+    entropy_str = f"| H={file_entropy:.2f}" if file_entropy is not None else ""
+    print(f"[{timestamp}] {event_type:<10} {Path(file_path).name:<30} {entropy_str}")
 
 
 # --------------------------------------------------
@@ -198,101 +280,73 @@ def record_event(event_type, file_path):
 class FileTelemetryHandler(FileSystemEventHandler):
 
     def on_created(self, event):
-
         if not event.is_directory:
-
-            record_event(
-                "CREATE",
-                event.src_path
-            )
+            record_event("CREATE", event.src_path)
 
     def on_modified(self, event):
-
         if not event.is_directory:
-
-            record_event(
-                "MODIFY",
-                event.src_path
-            )
+            record_event("MODIFY", event.src_path)
 
     def on_deleted(self, event):
-
         if not event.is_directory:
-
-            record_event(
-                "DELETE",
-                event.src_path
-            )
+            record_event("DELETE", event.src_path)
 
     def on_moved(self, event):
-
         if not event.is_directory:
-
-            record_event(
-                "MOVE_FROM",
-                event.src_path
-            )
-
-            record_event(
-                "MOVE_TO",
-                event.dest_path
-            )
+            record_event("MOVE_FROM", event.src_path)
+            record_event("MOVE_TO", event.dest_path)
 
 
 # --------------------------------------------------
-# MAIN
+# MAIN COLLECTOR RUNNER
 # --------------------------------------------------
 
-def main():
-
-    # Make sure required directories exist
+def run_collector(duration=None):
+    """
+    Runs the collector. If duration is given (in seconds), runs for that
+    time then stops. Otherwise runs until KeyboardInterrupt.
+    """
     WATCH_DIR.mkdir(exist_ok=True)
-
     initialize_database()
 
+    # Start background database writer thread
+    writer_thread = threading.Thread(target=db_writer_worker, daemon=True)
+    writer_thread.start()
+
     event_handler = FileTelemetryHandler()
-
     observer = Observer()
-
-    observer.schedule(
-        event_handler,
-        str(WATCH_DIR),
-        recursive=True
-    )
-
+    observer.schedule(event_handler, str(WATCH_DIR), recursive=True)
     observer.start()
 
-    print("=" * 60)
-    print(" RANSOMWARE EARLY-WARNING")
-    print(" FILE TELEMETRY COLLECTOR")
-    print("=" * 60)
+    print("=" * 65)
+    print("       RANSOMWARE EARLY-WARNING FILE TELEMETRY COLLECTOR")
+    print("=" * 65)
+    print(f" Monitoring Dir : {WATCH_DIR}")
+    print(f" Database       : {DATABASE_PATH}")
+    print(f" Active Run ID  : {RUN_ID}")
+    print(f" Real-Time Alert: ENABLED (Sliding Window: {SLIDING_WINDOW_SECONDS}s)")
+    print("=" * 65)
+    print(" Monitoring active file operations. Press CTRL+C to stop.\n")
 
-    print(f"Monitoring : {WATCH_DIR}")
-    print(f"Database   : {DATABASE_PATH}")
-    print(f"Run ID     : {RUN_ID}")
-
-    print()
-    print("Monitoring file activity...")
-    print("Press CTRL+C to stop.")
-    print("=" * 60)
-
+    start_time = time.time()
     try:
-
         while True:
             observer.join(1)
-
+            if duration and (time.time() - start_time) >= duration:
+                break
     except KeyboardInterrupt:
-
         print("\nStopping collector...")
-
+    finally:
         observer.stop()
+        observer.join()
+        _db_stop_event.set()
+        writer_thread.join(timeout=3.0)
+        print("Collector stopped successfully. All telemetry written to database.")
 
-    observer.join()
 
+def main():
+    run_collector()
 
-# --------------------------------------------------
-# PROGRAM ENTRY POINT
-# --------------------------------------------------
 
 if __name__ == "__main__":
     main()
