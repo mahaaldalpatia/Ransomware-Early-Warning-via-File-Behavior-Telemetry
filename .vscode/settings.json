@@ -1,0 +1,13 @@
+{
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/.venv/**": true,
+    "**/test_data/**": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/test_data": true
+  },
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe"
+}

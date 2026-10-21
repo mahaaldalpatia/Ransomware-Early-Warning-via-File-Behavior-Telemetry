@@ -91,6 +91,15 @@ def demo_report():
     generate_incident_report()
 
 
+def demo_pdf():
+    print("\n[+] Generating Project Guide & Viva Prep PDF...")
+    try:
+        from generate_pdf_report import create_project_pdf
+        create_project_pdf()
+    except Exception as e:
+        print(f"[!] Error generating PDF: {e}")
+
+
 def main_menu():
     while True:
         print_banner()
@@ -99,11 +108,12 @@ def main_menu():
         print("  3. Run Post-Incident Forensic Detector (Detailed Scorecard)")
         print("  4. View Visual Telemetry Dashboard (4-Panel Chart & PNG Export)")
         print("  5. Generate Comprehensive Incident Report (Markdown/Text in reports/)")
-        print("  6. Clean Up Test Directory")
-        print("  7. Exit")
+        print("  6. Export Project Guide & Viva Prep PDF (5-Page Document)")
+        print("  7. Clean Up Test Directory")
+        print("  8. Exit")
         print("=" * 70)
 
-        choice = input(" Select option [1-7]: ").strip()
+        choice = input(" Select option [1-8]: ").strip()
 
         if choice == "1":
             demo_normal_activity()
@@ -117,12 +127,14 @@ def main_menu():
         elif choice == "5":
             demo_report()
         elif choice == "6":
-            cleanup()
+            demo_pdf()
         elif choice == "7":
+            cleanup()
+        elif choice == "8":
             print("\nExiting Demonstration Suite. Good luck with your presentation!")
             break
         else:
-            print("\n[!] Invalid selection. Please enter a number between 1 and 7.")
+            print("\n[!] Invalid selection. Please enter a number between 1 and 8.")
 
         input("\nPress ENTER to return to menu...")
 
