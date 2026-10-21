@@ -16,6 +16,7 @@ database/*.db-shm
 # OS generated files
 .DS_Store
 Thumbs.db
+.vscode/
 
 # Test data (temporary simulated files)
 test_data/*.txt
