@@ -23,3 +23,4 @@ test_data/*.txt
 test_data/*.locked_test
 test_data/*.crypto
 test_data/*.enc
+real_world_data/*

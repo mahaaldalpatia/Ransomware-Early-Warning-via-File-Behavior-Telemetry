@@ -14,13 +14,13 @@ DATABASE_PATH = BASE_DIR / "database" / "telemetry.db"
 
 # Calibrated behavioral thresholds for early-warning detection
 OPERATION_RATE_THRESHOLD = 15.0       # ops/second
-MODIFICATION_THRESHOLD = 25          # total modify events
-EXTENSION_CHANGE_THRESHOLD = 5       # suspicious extension renames
+MODIFICATION_THRESHOLD = 20          # total modify events
+EXTENSION_CHANGE_THRESHOLD = 4       # suspicious extension renames
 ENTROPY_THRESHOLD = 7.0              # high entropy indicating encryption (0-8 scale)
 
 SUSPICIOUS_EXTENSIONS = (
-    ".locked_test", ".locked", ".crypto", ".enc",
-    ".crypted", ".ransom", ".wncry", ".dark"
+    ".locked", ".locked_test", ".crypto", ".enc",
+    ".crypted", ".ransom", ".wncry", ".dark", ".vault"
 )
 
 # ANSI terminal formatting (compatible with Windows PowerShell/Terminal)
@@ -39,7 +39,8 @@ CYAN = "\033[96m"
 def analyze_telemetry_run(run_id=None):
     """
     Analyzes telemetry records for a given run_id (or latest run).
-    Computes multi-signal behavioral scores and early-warning containment metrics.
+    Computes multi-signal behavioral scores, real-world file type distributions,
+    and early-warning containment metrics.
     """
     if not DATABASE_PATH.exists():
         print("[!] Telemetry database does not exist.")
@@ -84,6 +85,35 @@ def analyze_telemetry_run(run_id=None):
     cursor.execute("SELECT file_path FROM file_events WHERE run_id = ? AND event_type = 'MOVE_TO'", (run_id,))
     move_to_paths = [row[0] for row in cursor.fetchall()]
     extension_changes = sum(1 for p in move_to_paths if any(p.endswith(ext) for ext in SUSPICIOUS_EXTENSIONS))
+
+    # Real-World File Type Analysis
+    cursor.execute("SELECT file_path, entropy FROM file_events WHERE run_id = ?", (run_id,))
+    path_entropy_rows = cursor.fetchall()
+
+    extension_counts = {}
+    category_counts = {"Documents (.pdf, .docx, .txt)": 0, "Spreadsheets (.csv, .xlsx)": 0, "Images (.png, .jpg)": 0, "Data/Code (.json, .sql)": 0, "Ransom-Renamed": 0}
+
+    for fpath, ent in path_entropy_rows:
+        ext = Path(fpath).suffix.lower()
+        if any(fpath.endswith(s_ext) for s_ext in SUSPICIOUS_EXTENSIONS):
+            category_counts["Ransom-Renamed"] += 1
+            ext_label = ext if ext else "locked"
+        elif ext in [".pdf", ".docx", ".txt", ".doc", ".rtf"]:
+            category_counts["Documents (.pdf, .docx, .txt)"] += 1
+            ext_label = ext
+        elif ext in [".csv", ".xlsx", ".xls"]:
+            category_counts["Spreadsheets (.csv, .xlsx)"] += 1
+            ext_label = ext
+        elif ext in [".png", ".jpg", ".jpeg", ".bmp"]:
+            category_counts["Images (.png, .jpg)"] += 1
+            ext_label = ext
+        elif ext in [".json", ".sql", ".py", ".xml"]:
+            category_counts["Data/Code (.json, .sql)"] += 1
+            ext_label = ext
+        else:
+            ext_label = ext if ext else ".file"
+
+        extension_counts[ext_label] = extension_counts.get(ext_label, 0) + 1
 
     # Time range and Operations per second
     cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM file_events WHERE run_id = ?", (run_id,))
@@ -164,10 +194,7 @@ def analyze_telemetry_run(run_id=None):
         alert_level = "NORMAL BASELINE"
         alert_color = GREEN
 
-    # --------------------------------------------------
-    # EARLY WARNING CONTAINMENT ESTIMATE
-    # --------------------------------------------------
-    # If suspicious, find the timestamp/event where cumulative score breached threshold
+    # Early Warning & Blast Radius Analysis
     detection_time_sec = None
     files_at_detection = None
     containment_pct = None
@@ -194,7 +221,6 @@ def analyze_telemetry_run(run_id=None):
             if r_entropy and r_entropy >= ENTROPY_THRESHOLD:
                 hi_ent_count += 1
 
-            # Early warning condition triggered
             if (mod_count >= 10 and hi_ent_count >= 3) or (ext_count >= 5 and mod_count >= 5):
                 detection_ts = r_ts
                 files_at_detection = mod_count
@@ -225,6 +251,8 @@ def analyze_telemetry_run(run_id=None):
         "avg_entropy": avg_entropy,
         "max_entropy": max_entropy,
         "high_entropy_count": high_entropy_count,
+        "category_counts": category_counts,
+        "extension_counts": extension_counts,
         "burst_score": burst_score,
         "modification_score": modification_score,
         "extension_score": extension_score,
@@ -250,33 +278,40 @@ def display_report(metrics):
     color = metrics["alert_color"]
 
     print()
-    print("=" * 68)
-    print(f" {BOLD}RANSOMWARE EARLY-WARNING TELEMETRY DETECTOR{RESET}")
-    print("=" * 68)
+    print("=" * 70)
+    print(f" {BOLD}REAL-WORLD RANSOMWARE EARLY-WARNING BEHAVIORAL DETECTOR{RESET}")
+    print("=" * 70)
     print(f" Analyzed Run ID      : {metrics['run_id']}")
     print(f" Monitoring Duration  : {metrics['duration_seconds']:.2f} seconds")
     print(f" Total Events Logged  : {metrics['total_events']} ({metrics['unique_files']} distinct files)")
 
-    print("\n" + "-" * 68)
+    print("\n" + "-" * 70)
+    print(f" {BOLD}REAL-WORLD FILE TYPE SPECTRUM OBSERVED{RESET}")
+    print("-" * 70)
+    for category, count in metrics["category_counts"].items():
+        if count > 0:
+            print(f"  * {category:<35}: {count:>3} operations")
+
+    print("\n" + "-" * 70)
     print(f" {BOLD}BEHAVIORAL TELEMETRY FEATURES{RESET}")
-    print("-" * 68)
+    print("-" * 70)
     print(f"  Throughput Rate     : {metrics['operations_per_second']:.2f} operations/sec")
     print(f"  Modify Operations   : {metrics['modify_events']}")
     print(f"  Extension Changes   : {metrics['extension_changes']} (suspicious targets)")
     print(f"  Average Entropy     : {metrics['avg_entropy']:.4f} (Max: {metrics['max_entropy']:.4f})")
     print(f"  High-Entropy Files  : {metrics['high_entropy_count']} (H >= {ENTROPY_THRESHOLD})")
 
-    print("\n" + "-" * 68)
+    print("\n" + "-" * 70)
     print(f" {BOLD}MULTI-SIGNAL HEURISTIC SCORECARD{RESET}")
-    print("-" * 68)
+    print("-" * 70)
     print(f"  [1] Operation Burst Signal   : {metrics['burst_score']:>2} / 35")
     print(f"  [2] Modification Burst Signal: {metrics['modification_score']:>2} / 25")
     print(f"  [3] Extension Churn Signal   : {metrics['extension_score']:>2} / 20")
     print(f"  [4] Cryptographic Entropy    : {metrics['entropy_score']:>2} / 20")
-    print("-" * 68)
+    print("-" * 70)
     print(f"  TOTAL RISK SCORE             : {color}{BOLD}{metrics['total_risk_score']} / 100{RESET}")
     print(f"  THREAT CLASSIFICATION        : {color}{BOLD}[ {metrics['alert_level']} ]{RESET}")
-    print("=" * 68)
+    print("=" * 70)
 
     # Early Warning & Blast Radius Analysis
     if metrics["detection_time_sec"] is not None and metrics["containment_pct"] is not None:
@@ -284,25 +319,13 @@ def display_report(metrics):
         print(f"  [+] Early Warning Trigger Time : {metrics['detection_time_sec']:.2f}s into attack")
         print(f"  [+] Files Affected at Alert    : {metrics['files_at_detection']} of {metrics['unique_files']} files")
         print(f"  [+] Potential Blast Containment: {metrics['containment_pct']}% of user files preserved!")
-        print("-" * 68)
+        print("-" * 70)
 
-    # Explanation and forensic insights
-    print(f"\n{BOLD}FORENSIC EXPLANATION & INSIGHTS:{RESET}")
-    if metrics["burst_score"] > 0:
-        print("  [!] High file transaction frequency indicates automated script or malicious process.")
-    if metrics["modification_score"] > 0:
-        print("  [!] Dense burst of file modifications detected in short window.")
-    if metrics["extension_score"] > 0:
-        print("  [!] Files renamed to suspicious extensions typical of ransomware families.")
-    if metrics["entropy_score"] > 0:
-        print("  [!] Shannon entropy >= 7.0 detected, strongly indicating cryptographic encryption payload.")
-    if metrics["total_risk_score"] < 15:
-        print("  [OK] File operations remain within benign operational thresholds. No anomalies detected.")
     print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ransomware Early-Warning Behavioral Detector")
+    parser = argparse.ArgumentParser(description="Real-World Ransomware Behavioral Detector")
     parser.add_argument("--run", type=str, help="Specific run_id to analyze (defaults to latest)")
     args = parser.parse_args()
 

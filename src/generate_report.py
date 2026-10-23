@@ -90,7 +90,19 @@ The detection engine evaluates multi-dimensional file system behavior against fo
     md_content += f"""
 ---
 
-## 4. Forensic Telemetry Breakdown
+## 4. Real-World File Type Spectrum Observed
+
+| File Category | Operations Detected |
+| :--- | :--- |
+"""
+    for cat, cnt in metrics.get("category_counts", {}).items():
+        if cnt > 0:
+            md_content += f"| {cat} | {cnt} |\n"
+
+    md_content += f"""
+---
+
+## 5. Forensic Telemetry Breakdown
 
 - **CREATE Operations:** {metrics['create_events']}
 - **MODIFY Operations:** {metrics['modify_events']}
@@ -99,7 +111,7 @@ The detection engine evaluates multi-dimensional file system behavior against fo
 
 ---
 
-## 5. Security Recommendations
+## 6. Security Recommendations
 
 1. **Process Quarantine:** Immediately freeze any unauthenticated process exhibiting modification burst rates > 15 ops/s.
 2. **Automated Volume Snapshot:** Trigger shadow copy or isolated snapshot upon risk score crossing 35/100 (Medium).
